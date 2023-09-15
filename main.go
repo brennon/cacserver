@@ -39,22 +39,22 @@ func main() {
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
 		// ClientCAs: caCertPool,
-		// ClientAuth: tls.RequestClientCert,
-		// VerifyPeerCertificate: verifyPeerCertificate,
+		ClientAuth:            tls.RequestClientCert,
+		VerifyPeerCertificate: verifyPeerCertificate,
 	}
 	tlsConfig.BuildNameToCertificate()
 
 	// Create a Server instance to listen on port 8443 with the TLS config
 	server := &http.Server{
-		Addr: ":8443",
-		// TLSConfig: tlsConfig,
+		Addr:      ":443",
+		TLSConfig: tlsConfig,
 	}
 
-	log.Print("Starting server on :8443")
+	log.Print("Starting server on :443")
 
 	// Listen to HTTPS connections with the server certificate and wait
-	// log.Fatal(server.ListenAndServeTLS("cert.pem", "key.pem"))
-	log.Fatal(server.ListenAndServe())
+	log.Fatal(server.ListenAndServeTLS("cert.pem", "key.pem"))
+	// log.Fatal(server.ListenAndServe())
 }
 
 // func getClientCert(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
