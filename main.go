@@ -1,33 +1,145 @@
 package main
 
 import (
+	"bytes"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
-	"io"
+	"html/template"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
+	"os"
+
+	"golang.org/x/crypto/ocsp"
 )
 
+type Body struct {
+	Certificates        []*x509.Certificate
+	VerificationResults []string
+	OcspResults         []string
+}
+
 func helloHandler(w http.ResponseWriter, r *http.Request) {
-	// Write "Hello, world!" to the response body
-	io.WriteString(w, "Hello, world!\n")
+	tmpl := `
+	<!DOCTYPE html>
+	<html>
+	<head>
+		<title>Certificate Data</title>
+	</head>
+	<body>
+		<h1>Certificate Data</h1>
+		<ul>
+			{{range $i, $c := .Certificates}}
+				<li>Certificate {{$i}}</li>
+				<ul>
+					<li>Verification Result: {{index $.VerificationResults $i}}</li>
+					<li>OCSP Result: {{index $.OcspResults $i}}</li>
+					<li>Issuer: {{$c.Issuer.String}}</li>
+					<li>Subject: {{$c.Subject.String}}</li>
+					<li>NotBefore: {{$c.NotBefore}}</li>
+					<li>NotAfter: {{$c.NotAfter}}</li>
+					<li>SignatureAlgorithm: {{$c.SignatureAlgorithm}}</li>
+					<li>PublicKeyAlgorithm: {{$c.PublicKeyAlgorithm}}</li>
+					<li>Version: {{$c.Version}}</li>
+					<li>SerialNumber: {{$c.SerialNumber}}</li>
+					<li>KeyUsage: {{$c.KeyUsage}}</li>
+					<li>ExtKeyUsage: {{$c.ExtKeyUsage}}</li>
+					<li>BasicConstraintsValid: {{$c.BasicConstraintsValid}}</li>
+					<li>IsCA: {{$c.IsCA}}</li>
+					<li>MaxPathLen: {{$c.MaxPathLen}}</li>
+					<li>MaxPathLenZero: {{$c.MaxPathLenZero}}</li>
+					<li>SubjectKeyId: {{$c.SubjectKeyId}}</li>
+					<li>AuthorityKeyId: {{$c.AuthorityKeyId}}</li>
+					<li>OCSPServer: {{$c.OCSPServer}}</li>
+					<li>IssuingCertificateURL: {{$c.IssuingCertificateURL}}</li>
+					<li>DNSNames: {{$c.DNSNames}}</li>
+					<li>EmailAddresses: {{$c.EmailAddresses}}</li>
+					<li>IPAddresses: {{$c.IPAddresses}}</li>
+					<li>URIs: {{$c.URIs}}</li>
+					<li>PermittedDNSDomainsCritical: {{$c.PermittedDNSDomainsCritical}}</li>
+					<li>PermittedDNSDomains: {{$c.PermittedDNSDomains}}</li>
+					<li>ExcludedDNSDomains: {{$c.ExcludedDNSDomains}}</li>
+					<li>PermittedIPRanges: {{$c.PermittedIPRanges}}</li>
+					<li>ExcludedIPRanges: {{$c.ExcludedIPRanges}}</li>
+					<li>PermittedEmailAddresses: {{$c.PermittedEmailAddresses}}</li>
+					<li>ExcludedEmailAddresses: {{$c.ExcludedEmailAddresses}}</li>
+					<li>PermittedURIDomains: {{$c.PermittedURIDomains}}</li>
+					<li>ExcludedURIDomains: {{$c.ExcludedURIDomains}}</li>
+					<li>CRLDistributionPoints: {{$c.CRLDistributionPoints}}</li>
+					<li>PolicyIdentifiers: {{$c.PolicyIdentifiers}}</li>
+				</ul>
+			{{end}}
+		</ul>
+	</body>
+	</html>`
+
+	certificates := r.TLS.PeerCertificates
+	body := Body{
+		Certificates:        certificates,
+		VerificationResults: make([]string, len(certificates)),
+		OcspResults:         make([]string, len(certificates)),
+	}
+
+	certPool := getCertPool()
+	verifyOptions := x509.VerifyOptions{
+		Roots:         certPool,
+		Intermediates: certPool,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageAny},
+	}
+
+	for i, cert := range certificates {
+		chain, err := cert.Verify(verifyOptions)
+		if err != nil {
+			body.VerificationResults[i] = fmt.Sprintf("%v", err)
+			body.OcspResults[i] = "Cert verification failed. Not attempting OCSP."
+		} else {
+			body.VerificationResults[i] = "Success"
+			ocspResponse, err := getOcspResponse(chain[0])
+			if err != nil {
+				body.OcspResults[i] = fmt.Sprintf("%v", err)
+			} else {
+				body.OcspResults[i] = ocspResponse
+			}
+		}
+	}
+
+	t, err := template.New("body").Parse(tmpl)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = t.Execute(w, body)
+	if err != nil {
+		log.Fatal(err)
+	}
 }
 
 func main() {
 	log.Print("Starting up...")
 
 	// Set up a /hello resource handler
-	http.HandleFunc("/hello", helloHandler)
+	http.HandleFunc("/", helloHandler)
 
-	// Create a CA certificate pool and add cert.pem to it
-	caCert, err := ioutil.ReadFile("cert.pem")
+	// Create a CA certificate pool
+	caCertPool := getCertPool()
+
+	// Iterate over files in cacerts and add them to the CA certificate pool
+	files, err := ioutil.ReadDir("cacerts")
 	if err != nil {
 		log.Fatal(err)
 	}
-	caCertPool := x509.NewCertPool()
-	caCertPool.AppendCertsFromPEM(caCert)
+	for _, file := range files {
+		if !file.IsDir() {
+			cert, err := ioutil.ReadFile("cacerts/" + file.Name())
+			if err != nil {
+				log.Fatal(err)
+			}
+			caCertPool.AppendCertsFromPEM(cert)
+		}
+	}
 
 	// Read certificate from file
 	serverCert, err := tls.LoadX509KeyPair("cert.pem", "key.pem")
@@ -38,9 +150,10 @@ func main() {
 	// Create the TLS Config with the CA pool and enable Client certificate validation
 	tlsConfig := &tls.Config{
 		Certificates: []tls.Certificate{serverCert},
-		// ClientCAs: caCertPool,
-		ClientAuth:            tls.RequestClientCert,
-		VerifyPeerCertificate: verifyPeerCertificate,
+		// RootCAs:               caCertPool,
+		ClientCAs:  caCertPool,
+		ClientAuth: tls.RequireAndVerifyClientCert,
+		// VerifyPeerCertificate: verifyPeerCertificate,
 	}
 	tlsConfig.BuildNameToCertificate()
 
@@ -54,16 +167,75 @@ func main() {
 
 	// Listen to HTTPS connections with the server certificate and wait
 	log.Fatal(server.ListenAndServeTLS("cert.pem", "key.pem"))
-	// log.Fatal(server.ListenAndServe())
 }
 
-// func getClientCert(*tls.CertificateRequestInfo) (*tls.Certificate, error) {
-// 	log.Print("getClientCert")
-// 	return nil, nil
-// }
+func getCertPool() *x509.CertPool {
+	// Create a CA certificate pool and add cert.pem to it
+	caCert, err := os.ReadFile("cert.pem")
+	if err != nil {
+		log.Fatal(err)
+	}
 
-func verifyPeerCertificate(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
-	cert, err := x509.ParseCertificate(rawCerts[0])
-	fmt.Println(cert)
-	return err
+	caCertPool := x509.NewCertPool()
+	caCertPool.AppendCertsFromPEM(caCert)
+
+	// Iterate over files in cacerts and add them to the CA certificate pool
+	files, err := os.ReadDir("cacerts")
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, file := range files {
+		if !file.IsDir() {
+			cert, err := os.ReadFile("cacerts/" + file.Name())
+			if err != nil {
+				log.Fatal(err)
+			}
+			caCertPool.AppendCertsFromPEM(cert)
+		}
+	}
+	return caCertPool
+}
+
+func getOcspResponse(chain []*x509.Certificate) (status string, err error) {
+	if len(chain) == 1 {
+		return fmt.Sprintf("%s is self-signed. Not attempting OCSP request.\n", chain[0].Subject.CommonName), nil
+	}
+
+	buffer, err := ocsp.CreateRequest(chain[0], chain[1], nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	httpRequest, err := http.NewRequest(http.MethodPost, chain[0].OCSPServer[0], bytes.NewBuffer(buffer))
+	if err != nil {
+		log.Fatal(err)
+	}
+	ocspUrl, err := url.Parse(chain[0].OCSPServer[0])
+	if err != nil {
+		log.Fatal(err)
+	}
+	httpRequest.Header.Add("Host", ocspUrl.Host)
+	httpRequest.Header.Add("Content-Type", "application/ocsp-request")
+	httpRequest.Header.Add("Accept", "application/ocsp-response")
+	httpClient := &http.Client{}
+	httpResponse, err := httpClient.Do(httpRequest)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer httpResponse.Body.Close()
+	output, err := ioutil.ReadAll(httpResponse.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+	ocspResponse, err := ocsp.ParseResponseForCert(output, chain[0], chain[1])
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	if ocspResponse.Status != ocsp.Good {
+		errorString := fmt.Sprintf("OCSP status for %s is %d", chain[0].Subject.CommonName, ocspResponse.Status)
+		return errorString, errors.New(errorString)
+	} else {
+		return fmt.Sprintf("OCSP status for %s is Good\n", chain[0].Subject.CommonName), nil
+	}
 }
