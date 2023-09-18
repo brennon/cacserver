@@ -197,8 +197,12 @@ func getCertPool() *x509.CertPool {
 }
 
 func getOcspResponse(chain []*x509.Certificate) (status string, err error) {
-	if len(chain) == 1 {
+	if len(chain) < 2 {
 		return fmt.Sprintf("%s is self-signed. Not attempting OCSP request.\n", chain[0].Subject.CommonName), nil
+	}
+
+	if chain[0].OCSPServer == nil || chain[0].OCSPServer[0] == "" {
+		return fmt.Sprintf("%s does not have an OCSP server. Not attempting OCSP request.\n", chain[0].Subject.CommonName), nil
 	}
 
 	buffer, err := ocsp.CreateRequest(chain[0], chain[1], nil)
