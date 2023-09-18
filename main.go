@@ -20,6 +20,7 @@ type Body struct {
 	Certificates        []*x509.Certificate
 	VerificationResults []string
 	OcspResults         []string
+	CrlResults          []string
 }
 
 func helloHandler(w http.ResponseWriter, r *http.Request) {
@@ -37,6 +38,7 @@ func helloHandler(w http.ResponseWriter, r *http.Request) {
 				<ul>
 					<li>Verification Result: {{index $.VerificationResults $i}}</li>
 					<li>OCSP Result: {{index $.OcspResults $i}}</li>
+					<li>CRL Result: {{index $.CrlResults $i}}</li>
 					<li>Issuer: {{$c.Issuer.String}}</li>
 					<li>Subject: {{$c.Subject.String}}</li>
 					<li>NotBefore: {{$c.NotBefore}}</li>
@@ -81,6 +83,7 @@ func helloHandler(w http.ResponseWriter, r *http.Request) {
 		Certificates:        certificates,
 		VerificationResults: make([]string, len(certificates)),
 		OcspResults:         make([]string, len(certificates)),
+		CrlResults:          make([]string, len(certificates)),
 	}
 
 	certPool := getCertPool()
@@ -94,7 +97,8 @@ func helloHandler(w http.ResponseWriter, r *http.Request) {
 		chain, err := cert.Verify(verifyOptions)
 		if err != nil {
 			body.VerificationResults[i] = fmt.Sprintf("%v", err)
-			body.OcspResults[i] = "Cert verification failed. Not attempting OCSP."
+			body.OcspResults[i] = "Cert verification failed. Not attempting OCSP check."
+			body.CrlResults[i] = "Cert verification failed. Not attempting CRL check."
 		} else {
 			body.VerificationResults[i] = "Success"
 			ocspResponse, err := getOcspResponse(chain[0])
@@ -102,6 +106,14 @@ func helloHandler(w http.ResponseWriter, r *http.Request) {
 				body.OcspResults[i] = fmt.Sprintf("%v", err)
 			} else {
 				body.OcspResults[i] = ocspResponse
+
+			}
+
+			crlResponse, err := checkCertAgainstCrl(cert)
+			if err != nil {
+				body.CrlResults[i] = fmt.Sprintf("%v", err)
+			} else {
+				body.CrlResults[i] = crlResponse
 			}
 		}
 	}
@@ -115,6 +127,44 @@ func helloHandler(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		log.Fatal(err)
 	}
+}
+
+func checkCertAgainstCrl(cert *x509.Certificate) (status string, err error) {
+	if cert.CRLDistributionPoints == nil || cert.CRLDistributionPoints[0] == "" {
+		return "No CRL Distribution Points found. Not attempting CRL check.", nil
+	}
+
+	httpRequest, err := http.NewRequest(http.MethodGet, cert.CRLDistributionPoints[0], nil)
+	if err != nil {
+		log.Fatal(err)
+	}
+	crlUrl, err := url.Parse(cert.CRLDistributionPoints[0])
+	if err != nil {
+		log.Fatal(err)
+	}
+	httpRequest.Header.Add("Host", crlUrl.Host)
+	httpClient := &http.Client{}
+	httpResponse, err := httpClient.Do(httpRequest)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer httpResponse.Body.Close()
+	output, err := ioutil.ReadAll(httpResponse.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+	crl, err := x509.ParseRevocationList(output)
+	if err != nil {
+		log.Fatal(err)
+	}
+	for _, revokedCert := range crl.RevokedCertificates {
+		if revokedCert.SerialNumber.Cmp(cert.SerialNumber) == 0 {
+			errorString := fmt.Sprintf("Certificate %s IS revoked", cert.Subject.CommonName)
+			return errorString, errors.New(errorString)
+		}
+	}
+
+	return fmt.Sprintf("Certificate %s IS NOT revoked", cert.Subject.CommonName), nil
 }
 
 func main() {
